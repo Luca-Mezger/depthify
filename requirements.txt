@@ -1,0 +1,13 @@
+# Core (always needed)
+numpy>=1.24
+opencv-python>=4.8
+addict
+
+# Backend deps – install only what you need:
+#
+# DA3:        git clone https://github.com/ByteDance-Seed/Depth-Anything-3 && pip install -e .
+# UniDepth:   git clone https://github.com/lpiccinelli-eth/UniDepth && pip install -e .
+# MapAnything: git clone https://github.com/facebookresearch/map-anything && pip install -e .
+#
+# All backends need torch>=2.0, but each model repo pins its own version.
+# Don't install torch here – let the model repo handle it to avoid conflicts.
