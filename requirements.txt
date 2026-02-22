@@ -1,6 +1,7 @@
 # Core (always needed)
 numpy>=1.24
 opencv-python>=4.8
+h5py>=3.8
 addict
 
 # Backend deps – install only what you need:

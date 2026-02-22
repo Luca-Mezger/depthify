@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,7 +14,7 @@ import numpy as np
 from common import (
     append_manifest_line, compute_depth_stats, compute_temporal_jitter,
     find_videos, get_video_info, iter_video_frames, now_iso,
-    save_depth_npy, save_preview_png, write_json,
+    load_depth_npy, save_depth_npy, save_preview_png, write_json,
 )
 
 logger = logging.getLogger("depthify")
@@ -27,6 +29,7 @@ class BaseDepthRunner(abc.ABC):
 
     def __init__(self, device: str = "cuda", **kwargs):
         self.device = device
+        self._manifest_seen: dict[str, set[str]] = {}
 
     @abc.abstractmethod
     def load_model(self) -> None:
@@ -46,6 +49,48 @@ class BaseDepthRunner(abc.ABC):
         """'meters', 'model_units', or 'best_effort_meters'."""
         return "model_units"
 
+    def _manifest_cache_key(self, manifest_path: Path) -> str:
+        return str(manifest_path.resolve())
+
+    def _get_manifest_seen(self, manifest_path: Path) -> set[str]:
+        key = self._manifest_cache_key(manifest_path)
+        if key in self._manifest_seen:
+            return self._manifest_seen[key]
+        seen: set[str] = set()
+        if manifest_path.exists():
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    depth_path = rec.get("depth_path")
+                    if isinstance(depth_path, str):
+                        seen.add(depth_path)
+        self._manifest_seen[key] = seen
+        return seen
+
+    def _append_manifest_unique(self, manifest_path: Path, record: dict) -> None:
+        depth_path = record.get("depth_path")
+        if not isinstance(depth_path, str):
+            append_manifest_line(manifest_path, record)
+            return
+        seen = self._get_manifest_seen(manifest_path)
+        if depth_path in seen:
+            return
+        append_manifest_line(manifest_path, record)
+        seen.add(depth_path)
+
+    def _prepare_output_dir(self, out_dir: Path, write_preview: bool, overwrite: bool) -> None:
+        if overwrite and out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+        (out_dir / "depth").mkdir(parents=True, exist_ok=True)
+        if write_preview:
+            (out_dir / "preview").mkdir(parents=True, exist_ok=True)
+
     # ------------------------------------------------------------------
     # High-level: process one video
     # ------------------------------------------------------------------
@@ -57,23 +102,26 @@ class BaseDepthRunner(abc.ABC):
         chunk_size: int = 1, write_preview: bool = False,
         preview_max: Optional[int] = None,
         depth_dtype: str = "fp16",
+        skip_existing: bool = False,
+        overwrite: bool = False,
     ) -> dict:
         video_name = Path(video_path).stem
         out_dir = out_base / self.backend_name / video_name
+        self._prepare_output_dir(out_dir, write_preview=write_preview, overwrite=overwrite)
         depth_dir = out_dir / "depth"
-        depth_dir.mkdir(parents=True, exist_ok=True)
-        if write_preview:
-            (out_dir / "preview").mkdir(parents=True, exist_ok=True)
 
         manifest_path = out_base / self.backend_name / "manifest.jsonl"
         video_info = get_video_info(video_path)
 
         buf: list[Tuple[int, np.ndarray]] = []
         all_stats, recent_depths = [], []
-        n_processed = n_previews = 0
+        n_previews = 0
+        n_inferred = 0
+        n_reused = 0
+        n_selected = 0
 
         def _flush():
-            nonlocal n_processed, n_previews
+            nonlocal n_inferred, n_previews
             if not buf:
                 return
             indices = [i for i, _ in buf]
@@ -95,7 +143,7 @@ class BaseDepthRunner(abc.ABC):
                 all_stats.append(stats)
 
                 h, w = depth.shape
-                append_manifest_line(manifest_path, {
+                self._append_manifest_unique(manifest_path, {
                     "video": Path(video_path).name, "frame_index": fidx,
                     "depth_path": str(dp.relative_to(out_base)),
                     "width": w, "height": h,
@@ -113,16 +161,47 @@ class BaseDepthRunner(abc.ABC):
                 recent_depths.append(depth)
                 if len(recent_depths) > _JITTER_WINDOW:
                     recent_depths.pop(0)
-                n_processed += 1
+                n_inferred += 1
             buf.clear()
 
         for fidx, rgb in iter_video_frames(video_path, stride=stride,
                                             max_frames=max_frames, resize_to=resize_to):
+            n_selected += 1
+            if skip_existing:
+                dp = depth_dir / f"{fidx:06d}.npy"
+                if dp.exists():
+                    depth = load_depth_npy(dp)
+                    stats = compute_depth_stats(depth)
+                    stats["frame_index"] = fidx
+                    all_stats.append(stats)
+
+                    h, w = depth.shape
+                    self._append_manifest_unique(manifest_path, {
+                        "video": Path(video_path).name, "frame_index": fidx,
+                        "depth_path": str(dp.relative_to(out_base)),
+                        "width": w, "height": h,
+                        "backend": self.backend_name,
+                        "model_id": self.model_metadata().get("model_id", self.backend_name),
+                        "depth_units": self.depth_units(),
+                        "stride": stride,
+                        "resize_to": list(resize_to) if resize_to else None,
+                    })
+
+                    if write_preview and (preview_max is None or n_previews < preview_max):
+                        save_preview_png(out_dir / "preview" / f"{fidx:06d}.png", depth)
+                        n_previews += 1
+
+                    recent_depths.append(depth)
+                    if len(recent_depths) > _JITTER_WINDOW:
+                        recent_depths.pop(0)
+                    n_reused += 1
+                    continue
             buf.append((fidx, rgb))
             if len(buf) >= chunk_size:
                 _flush()
         _flush()
 
+        n_processed = n_inferred + n_reused
         jitter = compute_temporal_jitter(recent_depths) if len(recent_depths) > 1 else []
 
         meta = {
@@ -132,6 +211,10 @@ class BaseDepthRunner(abc.ABC):
             "stride": stride, "max_frames": max_frames,
             "resize_to": resize_to, "chunk_size": chunk_size,
             "depth_dtype": depth_dtype,
+            "skip_existing": bool(skip_existing),
+            "n_frames_selected": n_selected,
+            "n_frames_inferred": n_inferred,
+            "n_frames_reused": n_reused,
             "n_frames_processed": n_processed,
             "camera_intrinsics": None,  # fill with known K later
             "timestamp": now_iso(),
@@ -147,7 +230,10 @@ class BaseDepthRunner(abc.ABC):
                 f"(rolling window of {_JITTER_WINDOW}), not the full video.",
         })
 
-        logger.info(f"[{self.backend_name}] {video_name}: {n_processed} frames")
+        logger.info(
+            f"[{self.backend_name}] {video_name}: {n_processed} frames "
+            f"({n_inferred} inferred, {n_reused} reused)"
+        )
         return meta
 
     # ------------------------------------------------------------------

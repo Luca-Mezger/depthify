@@ -1,6 +1,6 @@
 # Depthify
 
-Offline depth caching from MP4 videos for Any3D-VLA training.
+Offline depth caching from MP4 videos or H5 trajectories for Any3D-VLA training.
 
 Three backends: **Depth Anything 3**, **UniDepthV2**, **MapAnything**.
 
@@ -33,6 +33,12 @@ python run_depth.py --backend mapanything --video_dir ./videos --out_dir ./depth
 
 # Smoke test (CPU, 10 frames)
 python run_depth.py --backend da3 --video_dir ./videos --out_dir ./depth_cache --device cpu --max_frames 10 --resize_w 320 --resize_h 240 --write_preview
+
+# H5 trajectory mode (ManiSkill/OpenVLA-style)
+python run_depth.py --backend da3 --h5_glob "../data/maniskill2/demos/*/motionplanning/trajectory.rgbd*.h5" --out_dir ./depth_cache --device cuda --chunk_size 16 --h5_camera_key base_camera
+
+# Resume mode (idempotent): skip already-written .npy files
+python run_depth.py --backend da3 --h5_glob "../data/maniskill2/demos/*/motionplanning/trajectory.rgbd*.h5" --out_dir ./depth_cache --skip_existing
 ```
 
 Run `python run_depth.py --help` for all flags.
@@ -51,7 +57,21 @@ depth_cache/
       preview/
         000000.png        # 8-bit colormap (if --write_preview)
     manifest.jsonl        # one line per frame with backend, model_id, depth_units, stride, resize
+    h5/
+      <source_id>/
+        traj_0/
+          meta.json
+          stats.json
+          depth/
+            000000.npy
+            000001.npy
 ```
+
+Notes:
+
+- `--skip_existing` is resume-safe and avoids recomputing frames already cached.
+- Manifest writing is deduplicated by `depth_path`, so re-runs do not append duplicate lines.
+- `--overwrite` removes per-item output folders before regeneration.
 
 ## OOM handling
 
